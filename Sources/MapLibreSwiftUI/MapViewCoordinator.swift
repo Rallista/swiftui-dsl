@@ -114,59 +114,101 @@ MLNMapViewDelegate {
         snapshotStyleSource = source
     }
 
+    /// Makes the style match the layers of ``parent``, and keeps the layers and sources that did not change.
     @MainActor func updateLayers(mapView: MLNMapView) {
-        // TODO: Figure out how to selectively update layers when only specific props changed. New function in addition to makeMLNStyleLayer?
+        let previousLayers = snapshotUserLayers
+        let layers = parent.userLayers
+        snapshotUserLayers = layers
 
-        // TODO: Extract this out into a separate function or three...
-        // Try to reuse DSL-defined sources if possible (they are the same type)!
-        if let style = mapView.style {
-            var sourcesToRemove = Set<String>()
-            for layer in snapshotUserLayers {
-                if let oldLayer = style.layer(withIdentifier: layer.identifier) {
-                    style.removeLayer(oldLayer)
-                }
+        // If the style is not loaded, the style didFinishLoading callback adds the layers.
+        guard let style = mapView.style else {
+            return
+        }
 
-                if let specWithSource = layer as? SourceBoundStyleLayerDefinition {
-                    switch specWithSource.source {
-                    case .mglSource:
-                        // Do Nothing
-                        // DISCUSS: The idea is to exclude "unmanaged" sources and only manage the ones specified via the DSL and attached to a layer.
-                        // This is a really hackish design and I don't particularly like it.
-                        continue
-                    case .source:
-                        // Mark sources for removal after all user layers have been removed.
-                        // Sources specified in this way should be used by a layer already in the style.
-                        sourcesToRemove.insert(specWithSource.source.identifier)
-                    }
-                }
+        let previousSources = managedSources(of: previousLayers)
+        let sources = managedSources(of: layers)
+        let replacedSources = updateSources(sources, from: previousSources, in: style)
+
+        // Each layer after the first change is added again, so that the layers keep their order.
+        let unchangedLayerCount = zip(previousLayers, layers).prefix { previous, layer in
+            guard isEqual(previous, layer), style.layer(withIdentifier: layer.identifier) != nil else {
+                return false
             }
+            guard let sourceID = (layer as? SourceBoundStyleLayerDefinition)?.source.identifier else {
+                return true
+            }
+            return !replacedSources.contains(sourceID)
+        }.count
 
-            // Remove sources that were added by layers specified in the DSL
-            for sourceID in sourcesToRemove {
-                if let source = style.source(withIdentifier: sourceID) {
-                    style.removeSource(source)
-                } else {
-                    print("That's funny... couldn't find identifier \(sourceID)")
-                }
+        for layer in previousLayers.dropFirst(unchangedLayerCount) {
+            if let oldLayer = style.layer(withIdentifier: layer.identifier) {
+                style.removeLayer(oldLayer)
             }
         }
 
-        // Snapshot the new user-defined layers
-        snapshotUserLayers = parent.userLayers
-
-        // If the style is loaded, add the new layers to it.
-        // Otherwise, this will get invoked automatically by the style didFinishLoading callback
-        if let style = mapView.style {
-            addLayers(to: style)
+        // Remove a source only after the layers that use it.
+        let removedSources = Set(previousSources.keys).subtracting(sources.keys).union(replacedSources)
+        for sourceID in removedSources {
+            if let source = style.source(withIdentifier: sourceID) {
+                style.removeSource(source)
+            }
         }
+
+        addLayers(Array(layers.dropFirst(unchangedLayerCount)), to: style)
     }
 
-    func addLayers(to mglStyle: MLNStyle) {
-        let firstSymbolLayer = mglStyle.layers.first { layer in
-            layer is MLNSymbolStyleLayer
+    /// Returns the sources that layers specify through the DSL, by identifier.
+    ///
+    /// This leaves out each ``MLNSource``, because the app manages it. For a shared identifier, the first
+    /// layer's source is used, because the style gets that one.
+    private func managedSources(of layers: [StyleLayerDefinition]) -> [String: Source] {
+        var sources: [String: Source] = [:]
+        for case let layer as SourceBoundStyleLayerDefinition in layers {
+            if case let .source(source) = layer.source, sources[source.identifier] == nil {
+                sources[source.identifier] = source
+            }
+        }
+        return sources
+    }
+
+    /// Updates the sources that stay in the style.
+    ///
+    /// - Returns: The identifiers of the sources that cannot change in place.
+    private func updateSources(
+        _ sources: [String: Source],
+        from previousSources: [String: Source],
+        in style: MLNStyle
+    ) -> Set<String> {
+        var replacedSources = Set<String>()
+        for (identifier, source) in sources {
+            if let previous = previousSources[identifier],
+               let styleSource = style.source(withIdentifier: identifier),
+               !source.update(styleSource, from: previous)
+            {
+                replacedSources.insert(identifier)
+            }
+        }
+        return replacedSources
+    }
+
+    private func isEqual(_ previous: StyleLayerDefinition, _ layer: StyleLayerDefinition) -> Bool {
+        func isEqual<Layer: Equatable>(_ previous: Layer) -> Bool {
+            previous == layer as? Layer
         }
 
-        for layerSpec in parent.userLayers {
+        guard let previous = previous as? any Equatable else {
+            return false
+        }
+        return isEqual(previous)
+    }
+
+    func addLayers(_ layers: [StyleLayerDefinition], to mglStyle: MLNStyle) {
+        let userLayerIdentifiers = Set(parent.userLayers.map(\.identifier))
+        let firstSymbolLayer = mglStyle.layers.first { layer in
+            layer is MLNSymbolStyleLayer && !userLayerIdentifiers.contains(layer.identifier)
+        }
+
+        for layerSpec in layers {
             // DISCUSS: What preventions should we try to put in place against the user accidentally adding the same layer twice?
             let newLayer = layerSpec.makeStyleLayer(style: mglStyle).makeMLNStyleLayer()
 
@@ -439,7 +481,7 @@ MLNMapViewDelegate {
 
     @MainActor
     public func mapView(_ mapView: MLNMapView, didFinishLoading mglStyle: MLNStyle) {
-        addLayers(to: mglStyle)
+        addLayers(parent.userLayers, to: mglStyle)
         let viewProxy = MapViewProxy(
             mapView: mapView,
             lastReasonForChange: nil

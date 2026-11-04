@@ -7,6 +7,22 @@ public protocol Source {
     var identifier: String { get }
 
     func makeMGLSource() -> MLNSource
+
+    /// Changes a source in a style so that it shows this definition.
+    ///
+    /// The default implementation returns `false`.
+    ///
+    /// - Parameters:
+    ///   - source: The source in the style.
+    ///   - previous: The definition that `source` shows.
+    /// - Returns: `false` if `source` cannot show this definition. The caller then replaces `source`.
+    func update(_ source: MLNSource, from previous: Source) -> Bool
+}
+
+public extension Source {
+    func update(_: MLNSource, from _: Source) -> Bool {
+        false
+    }
 }
 
 /// A description of the data underlying an ``MLNShapeSource``.
@@ -19,6 +35,25 @@ public enum ShapeData {
     case features([MLNShape & MLNFeature])
 }
 
+extension ShapeData: Equatable {
+    public static func == (lhs: ShapeData, rhs: ShapeData) -> Bool {
+        switch (lhs, rhs) {
+        case let (.geoJSONURL(lhs), .geoJSONURL(rhs)):
+            lhs == rhs
+        case let (.shapes(lhs), .shapes(rhs)):
+            lhs == rhs
+        case let (.features(lhs), .features(rhs)):
+            lhs.elementsEqual(rhs) { $0.isEqual($1) }
+        default:
+            false
+        }
+    }
+}
+
+/// A shape source with content that the map view updates when the definition changes.
+///
+/// To change the content, give new shape objects. The map view compares shapes with `isEqual(_:)`, so it
+/// does not see a change to a shape object that it already holds.
 public struct ShapeSource: Source {
     public let identifier: String
     public let options: [MLNShapeSourceOption: Any]?
@@ -44,6 +79,29 @@ public struct ShapeSource: Source {
         case let .features(features):
             MLNShapeSource(identifier: identifier, features: features, options: options)
         }
+    }
+
+    public func update(_ source: MLNSource, from previous: Source) -> Bool {
+        guard let source = source as? MLNShapeSource,
+              let previous = previous as? ShapeSource,
+              NSDictionary(dictionary: options ?? [:]).isEqual(to: previous.options ?? [:])
+        else {
+            return false
+        }
+
+        guard data != previous.data else {
+            return true
+        }
+
+        switch data {
+        case let .geoJSONURL(url):
+            source.url = url
+        case let .shapes(shapes):
+            source.shape = MLNShapeCollection(shapes: shapes)
+        case let .features(features):
+            source.shape = MLNShapeCollectionFeature(shapes: features)
+        }
+        return true
     }
 }
 
